@@ -5,12 +5,13 @@ use libc::{poll,pollfd,POLLIN,read,unlink,close,mkfifo,
            open,O_RDWR,c_void,posix_openpt, O_NOCTTY,
            grantpt, unlockpt, ptsname, fork, setsid,
            dup2, execvp, write, pid_t, kill, SIGKILL,
-           ioctl, TIOCSCTTY, fsync, POLLHUP };
+           ioctl, TIOCSCTTY, fsync, POLLHUP, pipe, waitpid };
 use termios::*;
 use std::os::unix::prelude::{RawFd, AsRawFd};
 use std::io::{Error,ErrorKind, Stdin, Write, Read};
 use std::mem;
 
+type CStr = *const i8;
 
 #[derive(Debug)]
 pub enum StreamEvent {
@@ -61,10 +62,57 @@ impl Muxable for NamedReadPipe {
     }
 }
 
+pub struct NamedWritePipe {
+    pub fd: RawFd,
+    pub name: String
+}
+
+impl NamedWritePipe {
+    pub fn new(name: String) -> Result<Self,StreamEvent> {
+        unsafe {
+            let cs = format!("{}\0", name);
+            let csptr = cs.as_bytes().as_ptr() as CStr;
+
+            unlink(csptr);
+            let ret = mkfifo(csptr, 0o666);
+            if ret == 0 {
+                // I use RDWR, because opening in O_RDONLY would block
+                // on open until someone open another end of pipe.
+                let fd = open(csptr, O_RDWR);
+                if fd > 0 {
+                    return Ok(NamedWritePipe{fd: fd, name: name});
+                }
+            }
+    
+            return Err(StreamEvent::Error("Can't open fifo".to_string()));
+        }
+    }
+}
+
+impl Write for NamedWritePipe {
+    fn write(&mut self, buff: &[u8]) -> Result<usize, Error> {
+        unsafe {
+            let n = write(self.fd, buff.as_ptr() as *const c_void, buff.len());
+            if n >= 0 {
+                Ok(n as usize)
+            } else {
+                Err(Error::new(ErrorKind::Other, format!("Can't write to {}", self.name)))
+            }
+        }
+    }
+    
+    fn flush(&mut self) -> Result<(), Error> {
+        if unsafe { fsync(self.fd) } == 0 {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorKind::Other, "Can't fsync"))
+        }
+    }
+}
 impl Muxable for std::io::Stdin {
     fn get_fds(&self) -> Vec<i32> { vec![0] }
     fn read_str(&mut self, _:i32) -> Result<Vec<u8>, StreamEvent> {
-        let mut buff: [u8; 10] = [0;10];
+        let mut buff: [u8; 256] = [0;256];
         match self.read(&mut buff) {
             Ok(n) => Ok(Vec::from(&buff[0..n])),
             Err(e) => Err(StreamEvent::Error(e.to_string()))
@@ -291,6 +339,93 @@ impl Write for IOPipe {
     }
 }
 
+pub struct Process {
+    pid: Option<pid_t>,
+    cmdline: Vec<String>,
+    redir_in: Option<RawFd>,
+    redir_out: Option<RawFd>,
+    redir_err: Option<RawFd>
+}
+
+impl Process {
+    pub fn new<'a>(cmdline: Vec<&'a str>) -> Self {
+        Process { pid: None,
+                  cmdline: cmdline.iter().map(|s| format!("{}\0", s))
+                                  .collect(),
+                  redir_in: None, 
+                  redir_out: None, redir_err: None }
+    }
+
+    pub fn push_arg(mut self, arg: String) -> Self {
+        self.cmdline.push(format!("{}\0", arg));
+        self
+    }
+
+    pub fn with_in(mut self, inp: RawFd) -> Self {
+        self.redir_in = Some(inp);
+        self
+    }
+
+    pub fn with_out(mut self, out: RawFd) -> Self {
+        self.redir_out = Some(out);
+        self
+    }
+
+    pub fn with_err(mut self, err: RawFd) -> Self {
+        self.redir_err = Some(err);
+        self
+    }
+    
+    pub fn spawn(mut self) -> Result<Self, String> {
+        let pid = unsafe { fork() };
+        if pid < 0 { return Err("Can't fork()".to_string()); }
+
+        if pid > 0 {
+            self.pid = Some(pid);
+            Ok(self)
+        } else {
+            unsafe {
+                self.redir_in.map(|fd| dup2(fd, 0));
+                self.redir_out.map(|fd| dup2(fd, 1));
+                self.redir_err.map(|fd| dup2(fd, 2));
+
+                let mut cargs : Vec<*const i8> =
+                    self.cmdline.iter().map(|str| str.as_ptr() as *const i8)
+                                .collect();
+                cargs.push(0 as *const i8);
+
+                execvp(self.cmdline[0].as_ptr() as *const i8, cargs.as_ptr() as *const *const i8);
+                Err("execvp() returned".to_string())
+            }
+        }
+    }
+
+    pub fn wait(self) -> i32 {
+        unsafe {
+            let mut status: i32 = 0;
+            waitpid(self.pid.unwrap(), &mut status as *mut i32, 0);
+            status
+        }
+    }
+}
+
+pub struct Pipe {
+    pub inp: RawFd,
+    pub out: RawFd
+}
+
+impl Pipe {
+    pub fn new() -> Result<Self,String> {
+        unsafe {
+            let mut fds : [i32;2] = [ -1, -1 ];
+            match pipe(fds.as_mut_ptr()) {
+                -1 => Err("Can't pipe()".to_string()),
+                _ => Ok(Pipe { inp: fds[0], out: fds[1] })
+            }
+        }
+    }
+}
+
 pub struct Pty {
     host: RawFd,
     guest: RawFd
@@ -314,35 +449,18 @@ impl Pty {
         }
     }
 
-    pub fn spawn_output(self, args: Vec<String>) -> Result<IOPipe, String> {
-        let pid = unsafe { fork() };
-        if pid < 0 { return Err("Can't fork()".to_string()); }
-
-        if pid > 0 {
-            unsafe { close(self.guest) };
-            return Ok(IOPipe::new(self.host, Some(pid)));
-        }
-
+    pub fn spawn<'a>(self, args: Vec<&'a str>, out: Option<NamedWritePipe>) -> Result<IOPipe, String> {
         unsafe {
-            close(self.host);
-
             setsid();
             ioctl(self.guest, TIOCSCTTY, 0 as *const c_void);
+    
+            let proc = Process::new(args)
+                               .with_in(self.guest)
+                               .with_out(out.map(|o| o.fd).unwrap_or(self.guest))
+                               .with_err(self.guest)
+                               .spawn();
 
-            dup2(self.guest, 0);
-            dup2(self.guest, 1);
-            dup2(self.guest, 2);
-
-            close(self.guest);
-
-            let mut cargs : Vec<*const i8> =
-                args.iter().map(|str| str.as_ptr() as *const i8)
-                           .collect();
-            cargs.push(0 as *const i8);
-
-            execvp(args[0].as_ptr() as *const i8, cargs.as_ptr() as *const *const i8);
-
-            return Err("execvp() returned!".to_string());
+            proc.map(|p| IOPipe::new(self.host, p.pid))
         }
     }
 }
@@ -362,6 +480,41 @@ impl DoCtrlD for IOPipe {
         let sig = [0x04 as u8];
         self.write(&sig).unwrap();
         true
+    }
+}
+
+pub struct MultiSource {
+    sources: Vec<Box<dyn Muxable>>
+}
+
+impl MultiSource {
+    pub fn new(size: usize) -> Self {
+        MultiSource { sources: Vec::with_capacity(size) }
+    }
+
+    pub fn add(mut self, source: Box<dyn Muxable>) -> Self {
+        self.sources.push(source);
+        self
+    }
+}
+
+impl Muxable for MultiSource {
+    fn get_fds(&self) -> Vec<i32> {
+        self.sources.iter()
+                    .flat_map(|s| s.get_fds())
+                    .collect()
+    }
+
+    fn read_str(&mut self, fd:i32) -> Result<Vec<u8>,StreamEvent> {
+        for s in &mut self.sources {
+            for srcfd in s.get_fds() {
+                if fd == srcfd {
+                    return s.read_str(fd);
+                }
+            }
+        }
+
+        Err(StreamEvent::Error(format!("Unexpected MultiSource Error: wrong fd {}", fd)))
     }
 }
 
@@ -410,31 +563,47 @@ impl<'a> Topology<'a> {
         self
     }
 
+    pub fn insert(&mut self, dest: Destination<'a>) {
+        dest.sources
+            .iter()
+            .for_each(|src| src.get_fds()
+                               .iter()
+                               .for_each(|fd| self.pollstruct.push(pollfd {
+                                                 fd: *fd,
+                                                 events: POLLIN,
+                                                 revents: 0 })));
+        self.destinations.push(dest);
+    }
+
     pub fn run(mut self) {
         loop {
-            unsafe {
-                let ret = poll(self.pollstruct.as_mut_ptr(), self.pollstruct.len() as u64, -1);
-                if ret > 0 {
-                    let mut i = 0;
-                    for di in 0..self.destinations.len() {
-                        let d = &mut self.destinations[di];
-                        for si in 0..d.sources.len() {
-                            for _ in d.sources[si].get_fds() {
-                                if self.pollstruct[i].revents & POLLIN > 0 {
-                                    match read_into(d.sources[si], self.pollstruct[i].fd, d.writer) {
-                                        Err(StreamEvent::Eof) => {
-                                            if !d.writer.ctrl_d() { return; }
-                                        },
+            self.tick(-1);
+        }
+    }
+
+    pub fn tick(&mut self, time: i32) {
+        unsafe {
+            let ret = poll(self.pollstruct.as_mut_ptr(), self.pollstruct.len() as u64, time);
+            if ret > 0 {
+                let mut i = 0;
+                for di in 0..self.destinations.len() {
+                    let d = &mut self.destinations[di];
+                    for si in 0..d.sources.len() {
+                        for _ in d.sources[si].get_fds() {
+                            if self.pollstruct[i].revents & POLLIN > 0 {
+                                match read_into(d.sources[si], self.pollstruct[i].fd, d.writer) {
+                                    Err(StreamEvent::Eof) => {
+                                        if !d.writer.ctrl_d() { return; }
+                                    },
                                         Err(StreamEvent::Error(e)) => panic!("{}", e),
                                         Err(_) => {},
                                         Ok(()) => {}
-                                    }
-                                } else if self.pollstruct[i].revents & POLLHUP > 0 {
-                                    return;
                                 }
-
-                                i+=1;
+                            } else if self.pollstruct[i].revents & POLLHUP > 0 {
+                                return;
                             }
+
+                            i+=1;
                         }
                     }
                 }
